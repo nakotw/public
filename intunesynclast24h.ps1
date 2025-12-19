@@ -1,3 +1,5 @@
+Connect-MgGraph -Scopes "DeviceManagementManagedDevices.ReadWrite.All"
+
 $Threshold = (Get-Date).AddHours(-24)
 
 $Devices = Get-MgDeviceManagementManagedDevice -All `
