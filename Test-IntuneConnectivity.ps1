@@ -1,6 +1,5 @@
 <#
 Script Name: Test-IntuneConnectivity.ps1
-Author: Joymalya Basu Roy
 
 DESCRIPTION
 The script is created based on the Microsoft 365 IP Address and URL web service (https://aka.ms/ipurlws). 
@@ -269,3 +268,4 @@ Get-NetIPConfiguration | ForEach-Object {
 }
 
 $NetworkConfiguration | Format-Table -AutoSize
+
