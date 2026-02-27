@@ -1,499 +1,556 @@
-# Connect with the required flag for purge operations
-Connect-ExchangeOnline
-Connect-IPPSSession -EnableSearchOnlySession
+<#  ------------------------------------------------------------
+ Friendly On-Screen UX Version (same logic, better output)
+-------------------------------------------------------------#>
 
-# Improved script to create a Compliance Search for recoverable items with hold policy management
-# MODIFIED: Only targets DiscoveryHolds folder
-
-# Prompt for the mailbox email address
-Write-Host "Enter the email address of the mailbox to search:" -ForegroundColor Cyan
-$Mailbox = Read-Host "Email address"
-
-# Validate email format
-if ($Mailbox -notmatch '^[\w\.-]+@[\w\.-]+\.\w+$') {
-    Write-Host "Invalid email address format. Exiting script." -ForegroundColor Red
-    exit
+# -----------------------------
+# UI helpers (friendly output)
+# -----------------------------
+function Write-Banner {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host ("=" * 72) -ForegroundColor Cyan
+    Write-Host ("  " + $Title) -ForegroundColor Cyan
+    Write-Host ("=" * 72) -ForegroundColor Cyan
+    Write-Host ""
 }
 
-Write-Host "Processing mailbox: $Mailbox" -ForegroundColor Green
-Write-Host "`n"
+function Write-Section {
+    param([string]$Title)
+    Write-Host ""
+    Write-Host ("-" * 72) -ForegroundColor DarkCyan
+    Write-Host ("  " + $Title) -ForegroundColor Cyan
+    Write-Host ("-" * 72) -ForegroundColor DarkCyan
+}
 
-# Check for hold policies
-Write-Host "=" * 60 -ForegroundColor Cyan
-Write-Host "CHECKING FOR HOLD POLICIES" -ForegroundColor Cyan
-Write-Host "=" * 60 -ForegroundColor Cyan
+function Write-Step {
+    param(
+        [int]$Number,
+        [string]$Text
+    )
+    Write-Host ("[$Number] " + $Text) -ForegroundColor Cyan
+}
+
+function Write-Info {
+    param([string]$Text)
+    Write-Host ("ℹ  " + $Text) -ForegroundColor Gray
+}
+
+function Write-Ok {
+    param([string]$Text)
+    Write-Host ("✅ " + $Text) -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([string]$Text)
+    Write-Host ("⚠️  " + $Text) -ForegroundColor Yellow
+}
+
+function Write-Err {
+    param([string]$Text)
+    Write-Host ("❌ " + $Text) -ForegroundColor Red
+}
+
+function Ask-Choice {
+    param(
+        [string]$Title,
+        [hashtable]$Options
+    )
+
+    Write-Host ""
+    Write-Host $Title -ForegroundColor Cyan
+    foreach ($k in ($Options.Keys | Sort-Object)) {
+        Write-Host ("  {0}. {1}" -f $k, $Options[$k]) -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    do {
+        $choice = Read-Host "Your choice"
+        if (-not $Options.ContainsKey($choice)) {
+            Write-Warn "Please enter one of: $($Options.Keys -join ', ')"
+        }
+    } while (-not $Options.ContainsKey($choice))
+
+    return $choice
+}
+
+function Ask-ConfirmExact {
+    param(
+        [string]$Prompt,
+        [string]$Exact = "YES"
+    )
+    Write-Host ""
+    Write-Warn $Prompt
+    $v = Read-Host "Type '$Exact' to confirm"
+    return ($v -eq $Exact)
+}
+
+function Show-SpinnerWhile {
+    param(
+        [scriptblock]$ConditionScript,
+        [int]$IntervalSeconds = 3,
+        [string]$Label = "Working"
+    )
+
+    $spinner = @('|','/','-','\')
+    $i = 0
+    while (& $ConditionScript) {
+        $c = $spinner[$i % $spinner.Count]
+        Write-Host -NoNewline "`r$c $Label... " -ForegroundColor Yellow
+        Start-Sleep -Seconds $IntervalSeconds
+        $i++
+    }
+    Write-Host "`r✅ $Label... done.     " -ForegroundColor Green
+}
+
+# -----------------------------
+# Connect sessions
+# -----------------------------
+Write-Banner "Exchange / Purview DiscoveryHolds Cleanup"
+
+Write-Step 1 "Connecting to Exchange Online + Purview session..."
+try {
+    Connect-ExchangeOnline -ErrorAction Stop | Out-Null
+    Connect-IPPSSession -EnableSearchOnlySession -ErrorAction Stop | Out-Null
+    Write-Ok "Connected successfully."
+} catch {
+    Write-Err "Connection failed: $($_.Exception.Message)"
+    return
+}
+
+# -----------------------------
+# Prompt mailbox
+# -----------------------------
+Write-Section "Mailbox selection"
+Write-Info "Tip: use the full UPN (example: user@company.com)."
+
+$Mailbox = Read-Host "Enter the mailbox email address"
+if ($Mailbox -notmatch '^[\w\.-]+@[\w\.-]+\.\w+$') {
+    Write-Err "That doesn't look like a valid email format. Exiting."
+    return
+}
+
+Write-Ok "Target mailbox: $Mailbox"
+
+# -----------------------------
+# Add mailbox to main hold policy exception
+# -----------------------------
+Write-Section "Retention policy: adding mailbox to MAIN hold policy exception"
+Write-Step 2 "Updating retention policy exception list..."
+try {
+    Set-RetentionCompliancePolicy `
+      -Identity "7 years retention policy" `
+      -AddExchangeLocationException $Mailbox
+
+    Write-Ok "$Mailbox added to the main hold policy exception list."
+} catch {
+    Write-Err "Failed to update retention policy: $($_.Exception.Message)"
+    return
+}
+
+# -----------------------------
+# Check holds
+# -----------------------------
+Write-Section "Checking holds (Litigation / In-Place / Delay Hold)"
+Write-Step 3 "Collecting mailbox hold information..."
 
 try {
     $mailboxInfo = Get-Mailbox -Identity $Mailbox -ErrorAction Stop
     $hasHolds = $false
     $holdPolicies = @()
 
-    # Check Litigation Hold
+    # Litigation Hold
     if ($mailboxInfo.LitigationHoldEnabled -eq $true) {
         $hasHolds = $true
-        Write-Host "✓ Litigation Hold: " -NoNewline -ForegroundColor Yellow
-        Write-Host "ENABLED" -ForegroundColor Red
+        Write-Warn "Litigation Hold is ENABLED (may block purge)."
         $holdPolicies += [PSCustomObject]@{
-            Type = "Litigation Hold"
-            Name = "Litigation Hold"
+            Type    = "Litigation Hold"
+            Name    = "Litigation Hold"
             Details = "Enabled on: $($mailboxInfo.LitigationHoldDate)"
         }
+    } else {
+        Write-Ok "Litigation Hold: not enabled."
     }
 
-    # Check In-Place Hold
+    # In-Place Holds
     if ($mailboxInfo.InPlaceHolds -and $mailboxInfo.InPlaceHolds.Count -gt 0) {
-        Write-Host "✓ In-Place Holds Found: " -NoNewline -ForegroundColor Yellow
-        Write-Host $mailboxInfo.InPlaceHolds.Count -ForegroundColor Red
-        
+
+        Write-Info "In-Place Holds found: $($mailboxInfo.InPlaceHolds.Count)"
         $activeHoldCount = 0
-        
+
         foreach ($hold in $mailboxInfo.InPlaceHolds) {
-            # Check for exclusion holds (those starting with -)
+
             if ($hold -match '^-UniH') {
-                # Retention Policy Exclusion - mailbox is EXCLUDED, not under hold
-                Write-Host "  - Retention Policy Exclusion: $hold " -NoNewline -ForegroundColor Green
-                Write-Host "(mailbox is excluded - WILL NOT block deletion)" -ForegroundColor Gray
-                continue  # Skip to next hold, don't add to holdPolicies
+                Write-Ok "Retention Policy exclusion detected: $hold (this will NOT block deletion)"
+                continue
             }
             elseif ($hold -match '^-mbx') {
-                # eDiscovery Hold Exclusion - mailbox is EXCLUDED, not under hold
-                Write-Host "  - eDiscovery Hold Exclusion: $hold " -NoNewline -ForegroundColor Green
-                Write-Host "(mailbox is excluded - WILL NOT block deletion)" -ForegroundColor Gray
-                continue  # Skip to next hold, don't add to holdPolicies
+                Write-Ok "eDiscovery Hold exclusion detected: $hold (this will NOT block deletion)"
+                continue
             }
             elseif ($hold -match '^UniH') {
-                # Unified Hold (Retention Policy) - ACTIVE HOLD
                 $activeHoldCount++
                 $policyName = "Retention Policy"
                 try {
                     $policy = Get-RetentionCompliancePolicy | Where-Object { $_.Guid -eq $hold.Replace('UniH', '') }
                     if ($policy) { $policyName = $policy.Name }
                 } catch { }
-                
+
                 $holdPolicies += [PSCustomObject]@{
-                    Type = "Retention Policy"
-                    Name = $policyName
+                    Type    = "Retention Policy"
+                    Name    = $policyName
                     Details = "Hold ID: $hold"
-                    HoldId = $hold
+                    HoldId  = $hold
                 }
-                Write-Host "  - $($holdPolicies[-1].Type): $($holdPolicies[-1].Name)" -ForegroundColor Yellow
+                Write-Warn "Active Retention Hold: $policyName"
             }
             elseif ($hold -match '^mbx') {
-                # eDiscovery Hold - ACTIVE HOLD
                 $activeHoldCount++
                 $policyName = "eDiscovery Hold"
                 try {
                     $case = Get-CaseHoldPolicy | Where-Object { $_.Guid -eq $hold.Replace('mbx', '') }
                     if ($case) { $policyName = $case.Name }
                 } catch { }
-                
+
                 $holdPolicies += [PSCustomObject]@{
-                    Type = "eDiscovery Hold"
-                    Name = $policyName
+                    Type    = "eDiscovery Hold"
+                    Name    = $policyName
                     Details = "Hold ID: $hold"
-                    HoldId = $hold
+                    HoldId  = $hold
                 }
-                Write-Host "  - $($holdPolicies[-1].Type): $($holdPolicies[-1].Name)" -ForegroundColor Yellow
+                Write-Warn "Active eDiscovery Hold: $policyName"
             }
             else {
-                # Unknown Hold Type
                 $activeHoldCount++
                 $holdPolicies += [PSCustomObject]@{
-                    Type = "Unknown Hold"
-                    Name = "Unknown"
+                    Type    = "Unknown Hold"
+                    Name    = "Unknown"
                     Details = "Hold ID: $hold"
-                    HoldId = $hold
+                    HoldId  = $hold
                 }
-                Write-Host "  - $($holdPolicies[-1].Type): $($holdPolicies[-1].Name)" -ForegroundColor Yellow
+                Write-Warn "Active Unknown Hold: $hold"
             }
         }
-        
-        # Only set hasHolds if there are active holds (not exclusions)
-        if ($activeHoldCount -gt 0) {
-            $hasHolds = $true
-        }
+
+        if ($activeHoldCount -gt 0) { $hasHolds = $true }
+        if ($activeHoldCount -eq 0) { Write-Ok "Only exclusions found (no active In-Place holds blocking purge)." }
+    } else {
+        Write-Ok "In-Place Holds: none found."
     }
 
-    # Check Delay Hold (might be present after removing a hold)
+    # Delay Hold
     if ($mailboxInfo.DelayHoldApplied -eq $true) {
         $hasHolds = $true
-        Write-Host "✓ Delay Hold: " -NoNewline -ForegroundColor Yellow
-        Write-Host "APPLIED" -ForegroundColor Red
-        Write-Host "  (Temporary hold after policy removal - can take up to 30 days to clear)" -ForegroundColor Gray
+        Write-Warn "Delay Hold is APPLIED (can take time to clear; may block purge)."
+        Write-Info "Delay Hold is usually temporary after hold removal (can take up to ~30 days)."
         $holdPolicies += [PSCustomObject]@{
-            Type = "Delay Hold"
-            Name = "Delay Hold"
+            Type    = "Delay Hold"
+            Name    = "Delay Hold"
             Details = "Temporary hold after policy removal"
         }
+    } else {
+        Write-Ok "Delay Hold: not applied."
     }
 
     if (-not $hasHolds) {
-        Write-Host "✓ No holds found on this mailbox" -ForegroundColor Green
+        Write-Ok "No active holds detected that should block purge."
+    } else {
+        Write-Warn "This mailbox has holds that may prevent deletion."
     }
 
-    Write-Host "=" * 60 -ForegroundColor Cyan
-    Write-Host "`n"
-
-    # If holds exist, ask user what to do
+    # Hold action choice
     if ($hasHolds) {
-        Write-Host "WARNING: This mailbox has active holds that may prevent deletion of recoverable items." -ForegroundColor Red
-        Write-Host "`nOptions:" -ForegroundColor Cyan
-        Write-Host "1. Remove holds and proceed with search/purge" -ForegroundColor Yellow
-        Write-Host "2. Proceed with search only (without removing holds - deletion will likely fail)" -ForegroundColor Yellow
-        Write-Host "3. Exit script" -ForegroundColor Yellow
-        Write-Host "`n"
-        
-        $choice = Read-Host "Enter your choice (1, 2, or 3)"
-        
+        $choice = Ask-Choice -Title "What would you like to do next?" -Options @{
+            "1" = "Try to remove/neutralize holds, then continue (recommended if you need to purge)"
+            "2" = "Continue with search only (purge will likely fail)"
+            "3" = "Exit safely"
+        }
+
         switch ($choice) {
             "1" {
-                Write-Host "`nRemoving hold policies..." -ForegroundColor Yellow
-                
+                Write-Section "Hold removal / exclusions"
+                Write-Step 4 "Processing hold changes..."
+
                 # Remove Litigation Hold
                 if ($mailboxInfo.LitigationHoldEnabled -eq $true) {
-                    Write-Host "Removing Litigation Hold..." -ForegroundColor Yellow
+                    Write-Info "Removing Litigation Hold..."
                     try {
                         Set-Mailbox -Identity $Mailbox -LitigationHoldEnabled $false
-                        Write-Host "✓ Litigation Hold removed" -ForegroundColor Green
+                        Write-Ok "Litigation Hold removed."
                     } catch {
-                        Write-Host "✗ Error removing Litigation Hold: $_" -ForegroundColor Red
+                        Write-Err "Error removing Litigation Hold: $($_.Exception.Message)"
                     }
                 }
-                
+
                 # Remove In-Place Holds
                 if ($mailboxInfo.InPlaceHolds -and $mailboxInfo.InPlaceHolds.Count -gt 0) {
-                    Write-Host "Removing In-Place Holds..." -ForegroundColor Yellow
-                    
+
                     foreach ($holdPolicy in $holdPolicies | Where-Object { $_.HoldId }) {
                         $hold = $holdPolicy.HoldId
-                        
+
                         if ($hold -match '^UniH') {
-                            # Retention Policy - need to exclude user
                             $policyId = $hold.Replace('UniH', '')
                             try {
                                 $policy = Get-RetentionCompliancePolicy | Where-Object { $_.Guid -eq $policyId }
                                 if ($policy) {
-                                    Write-Host "  Excluding user from Retention Policy: $($policy.Name)..." -ForegroundColor Yellow
-                                    
-                                    # Get current exclusions and add this mailbox
+                                    Write-Info "Excluding mailbox from Retention Policy: $($policy.Name)"
                                     $currentExclusions = @()
-                                    if ($policy.ExchangeLocationException) {
-                                        $currentExclusions = @($policy.ExchangeLocationException)
-                                    }
-                                    
-                                    # Only add if not already excluded
+                                    if ($policy.ExchangeLocationException) { $currentExclusions = @($policy.ExchangeLocationException) }
+
                                     if ($currentExclusions -notcontains $Mailbox) {
                                         $newExclusions = $currentExclusions + $Mailbox
                                         Set-RetentionCompliancePolicy -Identity $policy.Identity -ExchangeLocationException $newExclusions
-                                        Write-Host "  ✓ User excluded from $($policy.Name)" -ForegroundColor Green
+                                        Write-Ok "Excluded from $($policy.Name)."
                                     } else {
-                                        Write-Host "  ℹ User already excluded from $($policy.Name)" -ForegroundColor Cyan
+                                        Write-Info "Already excluded from $($policy.Name)."
                                     }
                                 }
                             } catch {
-                                Write-Host "  ✗ Error excluding from retention policy: $_" -ForegroundColor Red
+                                Write-Err "Error excluding from retention policy: $($_.Exception.Message)"
                             }
                         }
                         elseif ($hold -match '^mbx') {
-                            # eDiscovery Hold
                             $policyId = $hold.Replace('mbx', '')
                             try {
                                 $casePolicy = Get-CaseHoldPolicy | Where-Object { $_.Guid -eq $policyId }
                                 if ($casePolicy) {
-                                    Write-Host "  Removing mailbox from eDiscovery Hold: $($casePolicy.Name)..." -ForegroundColor Yellow
-                                    
-                                    # Check if mailbox is in the policy
+                                    Write-Info "Removing mailbox from eDiscovery Hold: $($casePolicy.Name)"
                                     $locations = @($casePolicy.ExchangeLocation)
+
                                     if ($locations -contains $Mailbox) {
                                         Set-CaseHoldPolicy -Identity $casePolicy.Identity -RemoveExchangeLocation $Mailbox
-                                        Write-Host "  ✓ User removed from $($casePolicy.Name)" -ForegroundColor Green
+                                        Write-Ok "Removed from $($casePolicy.Name)."
                                     } else {
-                                        Write-Host "  ℹ User not found in $($casePolicy.Name)" -ForegroundColor Cyan
+                                        Write-Info "Mailbox not listed in $($casePolicy.Name)."
                                     }
                                 }
                             } catch {
-                                Write-Host "  ✗ Error removing from eDiscovery hold: $_" -ForegroundColor Red
+                                Write-Err "Error removing from eDiscovery hold: $($_.Exception.Message)"
                             }
                         }
                     }
                 }
-                
-                Write-Host "`n✓ Hold policies processed. Waiting 30 seconds for changes to propagate..." -ForegroundColor Green
+
+                Write-Info "Waiting 30 seconds for changes to propagate..."
                 Start-Sleep -Seconds 30
-                
-                # Verify holds were removed
-                Write-Host "Verifying hold removal..." -ForegroundColor Cyan
+
+                Write-Step 5 "Verifying remaining holds..."
                 $updatedMailbox = Get-Mailbox -Identity $Mailbox
-                
+
                 $remainingHolds = @()
-                if ($updatedMailbox.LitigationHoldEnabled -eq $true) {
-                    $remainingHolds += "Litigation Hold"
-                }
-                
-                # Check for active holds only (ignore exclusions)
+                if ($updatedMailbox.LitigationHoldEnabled -eq $true) { $remainingHolds += "Litigation Hold" }
+
                 if ($updatedMailbox.InPlaceHolds -and $updatedMailbox.InPlaceHolds.Count -gt 0) {
                     $activeInPlaceHolds = @($updatedMailbox.InPlaceHolds | Where-Object { $_ -notmatch '^-' })
                     if ($activeInPlaceHolds.Count -gt 0) {
                         $remainingHolds += "In-Place Holds ($($activeInPlaceHolds.Count))"
-                        Write-Host "  Active holds (not exclusions):" -ForegroundColor Yellow
-                        foreach ($hold in $activeInPlaceHolds) {
-                            Write-Host "    $hold" -ForegroundColor Yellow
-                        }
+                        Write-Warn "Active In-Place holds still present:"
+                        foreach ($h in $activeInPlaceHolds) { Write-Host ("   - " + $h) -ForegroundColor Yellow }
                     }
                 }
-                
-                if ($updatedMailbox.DelayHoldApplied -eq $true) {
-                    $remainingHolds += "Delay Hold"
-                }
-                
+
+                if ($updatedMailbox.DelayHoldApplied -eq $true) { $remainingHolds += "Delay Hold" }
+
                 if ($remainingHolds.Count -eq 0) {
-                    Write-Host "✓ All holds successfully removed" -ForegroundColor Green
+                    Write-Ok "All blocking holds appear cleared."
                 } else {
-                    Write-Host "⚠ The following holds are still present:" -ForegroundColor Yellow
-                    foreach ($hold in $remainingHolds) {
-                        Write-Host "  - $hold" -ForegroundColor Yellow
-                    }
-                    
+                    Write-Warn "Some holds are still present: $($remainingHolds -join ', ')"
+
                     if ($updatedMailbox.DelayHoldApplied -eq $true) {
-                        Write-Host "`n⚠ IMPORTANT: Delay Hold detected!" -ForegroundColor Red
-                        Write-Host "Delay Hold can take up to 30 days to automatically clear." -ForegroundColor Yellow
-                        Write-Host "However, you can try to remove it immediately with the following command:" -ForegroundColor Cyan
-                        Write-Host "Set-Mailbox -Identity $Mailbox -RemoveDelayHoldApplied" -ForegroundColor White
-                        Write-Host "`nDo you want to attempt removing Delay Hold now? (Y/N): " -NoNewline -ForegroundColor Cyan
-                        $removeDelayHold = Read-Host
-                        
-                        if ($removeDelayHold -eq "Y" -or $removeDelayHold -eq "y") {
+                        Write-Warn "Delay Hold detected."
+                        Write-Info "You can attempt immediate removal with:"
+                        Write-Host "  Set-Mailbox -Identity $Mailbox -RemoveDelayHoldApplied" -ForegroundColor White
+
+                        $tryDelay = Read-Host "Attempt RemoveDelayHoldApplied now? (Y/N)"
+                        if ($tryDelay -match '^(Y|y)$') {
                             try {
-                                Write-Host "Attempting to remove Delay Hold..." -ForegroundColor Yellow
                                 Set-Mailbox -Identity $Mailbox -RemoveDelayHoldApplied
-                                Write-Host "✓ Delay Hold removal command executed" -ForegroundColor Green
-                                Write-Host "Waiting 30 seconds for changes to take effect..." -ForegroundColor Gray
+                                Write-Ok "Delay Hold removal command executed."
                                 Start-Sleep -Seconds 30
-                                
-                                # Verify again
-                                $finalCheck = Get-Mailbox -Identity $Mailbox
-                                if ($finalCheck.DelayHoldApplied -eq $false) {
-                                    Write-Host "✓ Delay Hold successfully removed!" -ForegroundColor Green
-                                } else {
-                                    Write-Host "⚠ Delay Hold still present. May require more time to clear." -ForegroundColor Yellow
-                                }
                             } catch {
-                                Write-Host "✗ Error removing Delay Hold: $_" -ForegroundColor Red
-                                Write-Host "The hold may require more time to clear naturally." -ForegroundColor Yellow
+                                Write-Err "Error removing Delay Hold: $($_.Exception.Message)"
                             }
                         }
                     }
-                    
-                    Write-Host "`n⚠ WARNING: Purge operations may fail while holds are active." -ForegroundColor Yellow
-                    Write-Host "Do you want to continue anyway? (Y/N): " -NoNewline -ForegroundColor Cyan
-                    $continueWithHolds = Read-Host
-                    
-                    if ($continueWithHolds -ne "Y" -and $continueWithHolds -ne "y") {
-                        Write-Host "Exiting script. Please resolve holds before retrying." -ForegroundColor Yellow
-                        exit
+
+                    $cont = Read-Host "Continue anyway (purge may fail)? (Y/N)"
+                    if ($cont -notmatch '^(Y|y)$') {
+                        Write-Ok "Exiting safely. Resolve holds then re-run."
+                        return
                     }
                 }
-                Write-Host "`n"
             }
             "2" {
-                Write-Host "`nProceeding with search only (holds remain active)..." -ForegroundColor Yellow
+                Write-Warn "Continuing with SEARCH ONLY. Purge will likely fail while holds remain."
             }
             "3" {
-                Write-Host "Exiting script..." -ForegroundColor Yellow
-                exit
-            }
-            default {
-                Write-Host "Invalid choice. Exiting script." -ForegroundColor Red
-                exit
+                Write-Ok "Exiting safely. No changes beyond what already ran."
+                return
             }
         }
     }
-}
-catch {
-    Write-Host "Error checking mailbox: $_" -ForegroundColor Red
-    exit
+
+} catch {
+    Write-Err "Error checking mailbox: $($_.Exception.Message)"
+    return
 }
 
+# -----------------------------
+# Search DiscoveryHolds only
+# -----------------------------
 $SearchName = "RecoverableItemsSearch_DiscoveryHolds_$Mailbox"
 
-# Check user RecoverableItems statistics
-Write-Host "Checking RecoverableItems statistics..." -ForegroundColor Cyan
-Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems | Select-Object Name, FolderAndSubfolderSize, ItemsInFolderAndSubfolders
+Write-Section "DiscoveryHolds search scope"
+Write-Step 6 "Showing RecoverableItems folder statistics (for visibility)"
+Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems |
+    Select-Object Name, FolderAndSubfolderSize, ItemsInFolderAndSubfolders |
+    Format-Table -AutoSize
 
-# Get ONLY the DiscoveryHolds folder - THIS IS THE KEY CHANGE
-Write-Host "Retrieving DiscoveryHolds folder..." -ForegroundColor Cyan
-$FolderIds = Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems | Where-Object { $_.Name -eq "DiscoveryHolds" -and $_.FolderId -ne $null } | Select-Object FolderId, Name
+Write-Step 7 "Retrieving DiscoveryHolds folder id..."
+$FolderIds = Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems |
+    Where-Object { $_.Name -eq "DiscoveryHolds" -and $_.FolderId -ne $null } |
+    Select-Object FolderId, Name
 
-# Verify we found the DiscoveryHolds folder
 if ($FolderIds -eq $null -or $FolderIds.Count -eq 0) {
-    Write-Host "DiscoveryHolds folder not found or is empty for $Mailbox." -ForegroundColor Yellow
-    Write-Host "This may be normal if there are no items in DiscoveryHolds." -ForegroundColor Gray
-    
-    # Show what folders were found
-    Write-Host "`nAvailable RecoverableItems folders:" -ForegroundColor Cyan
-    Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems | Select-Object Name, ItemsInFolderAndSubfolders | Format-Table -AutoSize
-    
-    exit
+    Write-Warn "DiscoveryHolds folder not found (or empty). This can be normal."
+    Write-Info "Available RecoverableItems folders:"
+    Get-MailboxFolderStatistics -Identity $Mailbox -FolderScope RecoverableItems |
+        Select-Object Name, ItemsInFolderAndSubfolders |
+        Format-Table -AutoSize
+    return
 }
 
-Write-Host "✓ Found DiscoveryHolds folder" -ForegroundColor Green
+Write-Ok "DiscoveryHolds folder found."
 
-# Define the nibbler array (hexadecimal characters)
-$nibbler = [byte[]]@(0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66)
-
-# Initialize query string
+# Build folderid query
+$nibbler = [byte[]]@(0x30,0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x61,0x62,0x63,0x64,0x65,0x66)
 $Query = ""
 
-# Process each folder and build the search query
-Write-Host "Building search query for DiscoveryHolds..." -ForegroundColor Cyan
+Write-Step 8 "Building ContentMatchQuery..."
 foreach ($Folder in $FolderIds) {
-    Write-Host "Processing folder: $($Folder.Name)" -ForegroundColor Yellow
-    
-    $folderIdBase64 = $Folder.FolderId
-    $folderIdBytes = [Convert]::FromBase64String($folderIdBase64)
+    Write-Info "Processing: $($Folder.Name)"
+    $folderIdBytes = [Convert]::FromBase64String($Folder.FolderId)
     $indexIdBytes = New-Object byte[] 48
     $indexIdIdx = 0
-    
+
     $folderIdBytes | Select-Object -Skip 23 -First 24 | ForEach-Object {
         $indexIdBytes[$indexIdIdx++] = $nibbler[$_ -shr 4]
         $indexIdBytes[$indexIdIdx++] = $nibbler[$_ -band 0xF]
     }
-    
+
     $folderId = [System.Text.Encoding]::ASCII.GetString($indexIdBytes)
-    
-    # Add to query with OR operator if not the first folder
-    if ($Query -ne "") {
-        $Query += " OR "
-    }
+    if ($Query -ne "") { $Query += " OR " }
     $Query += "folderid:$folderId"
 }
 
-# Check if we found any folders to search
-if ($Query -eq "") {
-    Write-Host "No DiscoveryHolds folder ID could be generated. Exiting script." -ForegroundColor Red
-    exit
+if ([string]::IsNullOrWhiteSpace($Query)) {
+    Write-Err "Could not generate folder query. Exiting."
+    return
 }
 
-Write-Host "Query generated: $Query" -ForegroundColor Gray
+Write-Info "Query: $Query"
 
-# Create and start the compliance search
-Write-Host "Creating compliance search '$SearchName'..." -ForegroundColor Green
+# Create search
+Write-Section "Compliance Search"
+Write-Step 9 "Preparing compliance search: $SearchName"
+
 $existingSearch = Get-ComplianceSearch -Identity $SearchName -ErrorAction SilentlyContinue
 if ($existingSearch) {
-    Write-Host "A search with name '$SearchName' already exists. Removing it before creating a new one." -ForegroundColor Yellow
+    Write-Warn "A search with the same name already exists. Removing it first..."
     Remove-ComplianceSearch -Identity $SearchName -Confirm:$false
+    Write-Ok "Old search removed."
 }
 
-New-ComplianceSearch -Name $SearchName -ExchangeLocation $Mailbox -ContentMatchQuery $Query
+try {
+    New-ComplianceSearch -Name $SearchName -ExchangeLocation $Mailbox -ContentMatchQuery $Query | Out-Null
+    Write-Ok "Compliance search created."
+} catch {
+    Write-Err "Failed to create compliance search: $($_.Exception.Message)"
+    return
+}
 
-Write-Host "Starting compliance search..." -ForegroundColor Green
-Start-ComplianceSearch -Identity $SearchName
+Write-Step 10 "Starting compliance search..."
+Start-ComplianceSearch -Identity $SearchName | Out-Null
 
-# Monitor search status
-Write-Host "Monitoring search status (press Ctrl+C to exit monitoring)..." -ForegroundColor Cyan
-do {
-    Start-Sleep -Seconds 5
-    $searchStatus = Get-ComplianceSearch -Identity $SearchName
-    Write-Host "Search status: $($searchStatus.Status)" -ForegroundColor Yellow
-} while ($searchStatus.Status -ne "Completed")
+# Monitor with spinner
+Show-SpinnerWhile -Label "Compliance search running" -IntervalSeconds 5 -ConditionScript {
+    $s = Get-ComplianceSearch -Identity $SearchName
+    return ($s.Status -ne "Completed")
+}
 
-# Show results
-Write-Host "Search completed. Details:" -ForegroundColor Green
-Start-Sleep -Seconds 2
+# Results
+Write-Section "Search results (DiscoveryHolds only)"
 $searchResults = Get-ComplianceSearch -Identity $SearchName
 $searchResults | Format-List Name, Status, Items, Size
 
-# Display summary
-Write-Host "`n"
-Write-Host "=" * 60 -ForegroundColor Cyan
-Write-Host "SEARCH RESULTS SUMMARY (DiscoveryHolds Only)" -ForegroundColor Cyan
-Write-Host "=" * 60 -ForegroundColor Cyan
-Write-Host "Mailbox: " -NoNewline -ForegroundColor White
-Write-Host $Mailbox -ForegroundColor Yellow
-Write-Host "Number of items found: " -NoNewline -ForegroundColor White
-Write-Host $searchResults.Items -ForegroundColor Yellow
-Write-Host "Total size: " -NoNewline -ForegroundColor White
-Write-Host $searchResults.Size -ForegroundColor Yellow
-Write-Host "=" * 60 -ForegroundColor Cyan
-Write-Host "`n"
+Write-Banner "SEARCH SUMMARY"
+Write-Host ("Mailbox: " + $Mailbox) -ForegroundColor Yellow
+Write-Host ("Items found: " + $searchResults.Items) -ForegroundColor Yellow
+Write-Host ("Total size: " + $searchResults.Size) -ForegroundColor Yellow
 
-# Simplified version WITHOUT loop
-# Use this if you're confident holds are removed and just want to submit the purge
-
-# ... [All your existing hold checking and removal code] ...
-# ... [All your existing search creation code] ...
-
-# After search completes and shows results:
-
+# -----------------------------
+# Purge (one-time submit)
+# -----------------------------
 if ($searchResults.Items -gt 0) {
-    Write-Host "Do you want to PURGE these items from DiscoveryHolds? This action is IRREVERSIBLE!" -ForegroundColor Red
-    Write-Host "Type 'YES' to confirm purge, or anything else to exit: " -NoNewline -ForegroundColor Yellow
-    $confirmation = Read-Host
-    
-    if ($confirmation -eq "YES") {
-        Write-Host "`nSubmitting purge request for $($searchResults.Items) items..." -ForegroundColor Red
-        Write-Host "Note: Microsoft will process these at ~10 items per minute." -ForegroundColor Yellow
-        Write-Host "Estimated completion time: $([math]::Round($searchResults.Items / 10 / 60, 1)) hours" -ForegroundColor Yellow
-        Write-Host "`nThis is a ONE-TIME submission. The purge will continue in the background." -ForegroundColor Cyan
-        Write-Host "You can close this window after the purge action is created.`n" -ForegroundColor Cyan
-        
-        try {
-            # Submit the purge (one time only)
-            $purgeActionName = "${SearchName}_Purge"
-            
-            # Remove any existing purge action
-            $existingPurgeAction = Get-ComplianceSearchAction -Identity $purgeActionName -ErrorAction SilentlyContinue
-            if ($existingPurgeAction) {
-                Write-Host "Removing previous purge action..." -ForegroundColor Yellow
-                Remove-ComplianceSearchAction -Identity $purgeActionName -Confirm:$false
-                Start-Sleep -Seconds 5
-            }
-            
-            # Create the purge action
-            Write-Host "Creating purge action..." -ForegroundColor Yellow
-            New-ComplianceSearchAction -SearchName $SearchName -Purge -PurgeType HardDelete -Confirm:$false | Out-Null
-            
-            # Wait for it to start
-            Write-Host "Waiting for purge to initialize..." -ForegroundColor Cyan
-            Start-Sleep -Seconds 30
-            
-            # Check initial status
-            $purgeStatus = Get-ComplianceSearchAction -Identity $purgeActionName
-            
-            Write-Host "`n" 
-            Write-Host "=" * 60 -ForegroundColor Green
-            Write-Host "PURGE SUBMITTED SUCCESSFULLY" -ForegroundColor Green
-            Write-Host "=" * 60 -ForegroundColor Green
-            Write-Host "Purge Action Name: " -NoNewline -ForegroundColor White
-            Write-Host $purgeActionName -ForegroundColor Yellow
-            Write-Host "Status: " -NoNewline -ForegroundColor White
-            Write-Host $purgeStatus.Status -ForegroundColor Yellow
-            Write-Host "Items to delete: " -NoNewline -ForegroundColor White
-            Write-Host $searchResults.Items -ForegroundColor Yellow
-            Write-Host "`nThe purge will continue in the background." -ForegroundColor Cyan
-            Write-Host "You can monitor progress with these commands:" -ForegroundColor Cyan
-            Write-Host "`n  Get-ComplianceSearchAction -Identity '$purgeActionName' | FL Status,Results" -ForegroundColor White
-            Write-Host "  Start-ComplianceSearch -Identity '$SearchName' -Force" -ForegroundColor White
-            Write-Host "  Get-ComplianceSearch -Identity '$SearchName' | FL Items,Size" -ForegroundColor White
-            Write-Host "`nCheck back in $([math]::Round($searchResults.Items / 10 / 60, 1)) hours to verify completion." -ForegroundColor Yellow
-            Write-Host "=" * 60 -ForegroundColor Green
-            
-        } catch {
-            Write-Host "✗ Error creating purge action: $_" -ForegroundColor Red
-            if ($_.Exception.Message -like "*hold*") {
-                Write-Host "`nThis error suggests holds may still be active." -ForegroundColor Yellow
-                Write-Host "Run this command to check: Get-Mailbox -Identity $Mailbox | FL *Hold*" -ForegroundColor Cyan
-            }
-            elseif ($_.Exception.Message -like "*EnableSearchOnlySession*") {
-                Write-Host "`nERROR: The PowerShell session was not created with -EnableSearchOnlySession flag." -ForegroundColor Red
-                Write-Host "Please disconnect and reconnect using: Connect-IPPSSession -EnableSearchOnlySession" -ForegroundColor Yellow
-            }
-        }
-    } else {
-        Write-Host "Purge cancelled. Items remain in DiscoveryHolds." -ForegroundColor Yellow
+
+    $doPurge = Ask-ConfirmExact -Prompt "Purge $($searchResults.Items) item(s) from DiscoveryHolds? This is IRREVERSIBLE." -Exact "YES"
+    if (-not $doPurge) {
+        Write-Warn "Purge cancelled. Items remain in DiscoveryHolds."
+        Write-Banner "Done"
+        Write-Ok "Script complete. You can close this window."
+        return
     }
+
+    Write-Section "Purge submission"
+    Write-Step 11 "Submitting purge request..."
+    Write-Info "Microsoft processes purge roughly ~10 items/minute (varies)."
+    $estHours = [math]::Round($searchResults.Items / 10 / 60, 1)
+    Write-Info "Rough estimate: ~$estHours hour(s)."
+
+    try {
+        $purgeActionName = "${SearchName}_Purge"
+
+        $existingPurgeAction = Get-ComplianceSearchAction -Identity $purgeActionName -ErrorAction SilentlyContinue
+        if ($existingPurgeAction) {
+            Write-Warn "Previous purge action found. Removing it..."
+            Remove-ComplianceSearchAction -Identity $purgeActionName -Confirm:$false
+            Start-Sleep -Seconds 5
+            Write-Ok "Previous purge action removed."
+        }
+
+        Write-Info "Creating new purge action..."
+        New-ComplianceSearchAction -SearchName $SearchName -Purge -PurgeType HardDelete -Confirm:$false | Out-Null
+
+        Write-Info "Waiting 30 seconds for purge to initialize..."
+        Start-Sleep -Seconds 30
+
+        $purgeStatus = Get-ComplianceSearchAction -Identity $purgeActionName
+
+        Write-Banner "PURGE SUBMITTED"
+        Write-Ok "Purge Action Name: $purgeActionName"
+        Write-Info "Status: $($purgeStatus.Status)"
+        Write-Info "Items targeted: $($searchResults.Items)"
+        Write-Info "Monitor progress with:"
+        Write-Host "  Get-ComplianceSearchAction -Identity '$purgeActionName' | FL Status,Results" -ForegroundColor White
+        Write-Host "  Get-ComplianceSearch -Identity '$SearchName' | FL Items,Size,Status" -ForegroundColor White
+        Write-Host ""
+        Write-Info "Check back in ~${estHours} hour(s) to verify completion." -ForegroundColor Yellow
+
+    } catch {
+        Write-Err "Error creating purge action: $($_.Exception.Message)"
+        if ($_.Exception.Message -like "*hold*") {
+            Write-Warn "This suggests holds may still be active."
+            Write-Info "Run: Get-Mailbox -Identity $Mailbox | FL *Hold*"
+        }
+        if ($_.Exception.Message -like "*EnableSearchOnlySession*") {
+            Write-Warn "Your session may not be connected with -EnableSearchOnlySession."
+            Write-Info "Reconnect using: Connect-IPPSSession -EnableSearchOnlySession"
+        }
+        return
+    }
+
 } else {
-    Write-Host "No items found to purge in DiscoveryHolds." -ForegroundColor Green
+    Write-Ok "No items found to purge in DiscoveryHolds."
 }
 
-Write-Host "`nScript complete. You can now close this window." -ForegroundColor Green
+Write-Banner "Done"
+Write-Ok "Script complete. You can close this window."
